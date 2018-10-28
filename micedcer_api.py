@@ -35,7 +35,7 @@ from ryu.lib.packet import ether_types
 _physicSwitch = False
 
 
-class MicePRSApi(app_manager.RyuApp):
+class MiceDCERApi(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     #-------------------------------------------------------------------------
@@ -43,7 +43,7 @@ class MicePRSApi(app_manager.RyuApp):
     #-------------------------------------------------------------------------
 
     def __init__(self, *args, **kwargs):
-        super(MicePRSApi, self).__init__(*args, **kwargs)
+        super(MiceDCERApi, self).__init__(*args, **kwargs)
 
         self.td_network = nx.DiGraph()
         self.td_changes = 0
@@ -190,8 +190,8 @@ class MicePRSApi(app_manager.RyuApp):
             self.install_rule_arp(dp, 30, "CONTROLLER")
             self.edges.append(dp)
         else:
-            # Install ARP Rule to FLOOD
-            self.install_rule_arp(dp, 30, "FLOOD")
+            # Install ARP Rule to Drop
+            self.install_rule_arp(dp, 30)
             if (level == "CORE"):
                 self.cores.append(dp)
             elif (level == "AGGREGATE"):
@@ -321,6 +321,10 @@ class MicePRSApi(app_manager.RyuApp):
         ofp_parser = dp.ofproto_parser
         in_port = msg.match['in_port']
 
+        pkt_eth = pkt.get_protocol(ethernet.ethernet)
+        eth_dst = pkt_eth.dst
+        eth_src = pkt_eth.src
+
         pkt_arp = pkt.get_protocol(arp.arp)
         src_mac = pkt_arp.src_mac
         dst_mac = pkt_arp.dst_mac
@@ -332,9 +336,6 @@ class MicePRSApi(app_manager.RyuApp):
         # Check if packet comes from host
         if (in_port != ofp.OFPP_CONTROLLER
         and in_port not in self.ports_e2a[dpid]):
-
-            # Raise from-host packet flag
-            fromHost = True
 
             # Generate PMAC from source host
             pmac = self.generate_pmac(dpid, in_port, src_mac, src_ip)
@@ -348,34 +349,29 @@ class MicePRSApi(app_manager.RyuApp):
                 self.installed_rules.append((dp, src_mac, pmac))
                 self.install_rule_pmac(dp, src_mac, pmac, in_port)
 
-        else:
-            fromHost = False
-
         if pkt_arp.opcode == 1:  # ARP request
 
             self.logger.info(
                 "\nReceived ARP request in datapath (%s), port %s:" +
-                "\n%s (%s) -> %s (%s)",
-                dpid, in_port, src_ip, src_mac, dst_ip, dst_mac
+                "\n%s (%s) -> %s (%s)\n: From (%s) to (%s)",
+                dpid, in_port, src_ip, src_mac, dst_ip, dst_mac,
+                eth_src, eth_dst
             )
 
             # If the destination IP is unknown by the controller
             if dst_ip not in self.ip_table:
-                if fromHost:
-                    # Pending Request
-                    self.pending_reqs.append({
-                        'srcIp': src_ip, 'dstIp': dst_ip
-                    })
-                    self.logger.info(": Pending requests: %s",
-                        self.pending_reqs)
 
-                    # Rewrite ARP source MAC (arp_sha) with host PMAC
-                    actions = [ofp_parser.OFPActionSetField(arp_sha=pmac),
-                               ofp_parser.OFPActionOutput(ofp.OFPP_FLOOD)]
-                    self.logger.info(": Changed source MAC to PMAC: %s -> %s",
-                                     src_mac, pmac)
-                else:
-                    actions = [ofp_parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+                self.pending_reqs.append({
+                    'srcIp': src_ip, 'dstIp': dst_ip
+                })
+                self.logger.info(": Pending requests: %s",
+                    self.pending_reqs)
+
+                # Rewrite ARP source MAC (arp_sha) with host PMAC
+                actions = [ofp_parser.OFPActionSetField(arp_sha=pmac),
+                           ofp_parser.OFPActionOutput(ofp.OFPP_ALL)]
+                self.logger.info(": Changed source MAC to PMAC: %s -> %s",
+                                 src_mac, pmac)
 
                 self.logger.info(": FLOOD")
                 data = msg.data
@@ -384,6 +380,34 @@ class MicePRSApi(app_manager.RyuApp):
                     in_port=in_port, actions=actions, data=data
                 )
                 dp.send_msg(out)
+
+                # Generate Request
+                e = ethernet.ethernet(src=pmac, dst=eth_dst,
+                                      ethertype=ether_types.ETH_TYPE_ARP)
+                a = arp.arp(src_mac=pmac, src_ip=src_ip,
+                            dst_mac=dst_mac, dst_ip=dst_ip, opcode=1)
+                p = packet.Packet()
+                p.add_protocol(e)
+                p.add_protocol(a)
+                p.serialize()
+
+                for edge in self.edges:
+                    if edge.id != dpid:
+                        # Send Request Packet
+                        actions = [ofp_parser.OFPActionOutput(ofp.OFPP_ALL)]
+                        out = ofp_parser.OFPPacketOut(
+                            datapath=edge, buffer_id=ofp.OFP_NO_BUFFER,
+                            in_port=ofp.OFPP_CONTROLLER, actions=actions,
+                            data=p.data
+                        )
+                        edge.send_msg(out)
+
+                        self.logger.info(
+                            ": Request generated in datapath (%s) " +
+                            "to all ports: \n: %s (%s) -> %s (%s)",
+                            edge.id, pmac, src_ip, dst_mac, dst_ip
+                        )
+
             else:
                 dst_pmac = self.ip_table[dst_ip]['pmac']
 
@@ -467,21 +491,25 @@ class MicePRSApi(app_manager.RyuApp):
     #   * Install ARP Rule
     #-------------------------------------------------------------------------
 
-    def install_rule_arp(self, dp, priority, output):
+    def install_rule_arp(self, dp, priority, output=None):
 
         ofp = dp.ofproto
         ofp_parser = dp.ofproto_parser
 
         match = ofp_parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
 
-        if output == "CONTROLLER":
-            out_port = ofp.OFPP_CONTROLLER
-        elif output == "FLOOD":
-            out_port = ofp.OFPP_FLOOD
+        if not output:
+            actions = []
         else:
-            out_port = output
-
-        actions = [ofp_parser.OFPActionOutput(out_port)]
+            if output == "CONTROLLER":
+                out_port = ofp.OFPP_CONTROLLER
+            elif output == "FLOOD":
+                out_port = ofp.OFPP_FLOOD
+            elif output == "ALL":
+                out_port = ofp.OFPP_ALL
+            else:
+                out_port = output
+            actions = [ofp_parser.OFPActionOutput(out_port)]
 
         self.add_flow(dp, priority, match, actions)
         self.logger.info("Rule installed on datapath (%s):" +
@@ -505,7 +533,7 @@ class MicePRSApi(app_manager.RyuApp):
         self.add_flow_table(dp, 20, 1, match, actions)
 
         self.logger.info("Rule installed on datapath (%s) [Table 0]:" +
-                         "\n: [IPv4] Src: %s -> SetField(eth_src = %s), Table 1",
+                         "\n: [IPv4] Src: %s -> eth_src = %s, Table 1",
                          dp.id, amac, pmac)
 
         # Install rule for source MAC change on table 1
@@ -517,7 +545,7 @@ class MicePRSApi(app_manager.RyuApp):
         self.add_flow(dp, 10, match, actions, 1)
 
         self.logger.info("Rule installed on datapath (%s) [Table 1]:" +
-                         "\n: [IPv4] Dst: %s -> SetField(eth_dst = %s), Table 1",
+                         "\n: [IPv4] Dst: %s -> eth_dst = %s, Table 1",
                          dp.id, pmac, amac)
 
     #-------------------------------------------------------------------------
