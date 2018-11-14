@@ -12,6 +12,7 @@ __title__ = "MicePRS - Mice (Flows) Physical Routing and Splitting"
 __author__ = 'cfamezquita'
 __year__ = "2013-2018"
 
+import time
 import networkx as nx
 
 from ryu.base import app_manager
@@ -23,7 +24,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event
 from ryu.topology.api import get_switch, get_link
 from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet, arp
+from ryu.lib.packet import ethernet, lldp, arp
 from ryu.lib.packet import ether_types
 
 #=============================================================================
@@ -32,7 +33,8 @@ from ryu.lib.packet import ether_types
 #
 #=============================================================================
 
-_physicSwitch = False
+_lldpTimeout = 10
+_threshold = 60
 
 
 class MiceDCERApi(app_manager.RyuApp):
@@ -65,6 +67,17 @@ class MiceDCERApi(app_manager.RyuApp):
         self.pending_reqs = []
 
         self.installed_rules = []
+
+        self.switch_info = {}
+        self.init_time = 0
+        self.time_table = {}
+
+        # LLDP variables
+        self.lldp_neighbors = {}
+        self.lldp_level = {}
+
+        self.lldp_timeout = False
+        self.lldp_complete = False
 
     #-------------------------------------------------------------------------
     #   * RYU Event: Switch Features
@@ -133,16 +146,23 @@ class MiceDCERApi(app_manager.RyuApp):
                        for l in links_list]
         self.td_network.add_edges_from(topo_links2)
 
-        # Configure Switch
-        self.configure_switch(switch.dp)
+        # Initialize LLDP Attributes for Switch
+        self.lldp_neighbors.setdefault(switch.dp.id, [])
+        self.lldp_level.setdefault(switch.dp.id, 0)
+        self.switch_info[switch.dp.id] = {
+            'dp': switch.dp,
+            'ports': len(switch.ports)
+        }
 
         # Check Topology Changes
         self.td_changes -= 1
         if self.td_changes == 0:
-            self.logger.info("\nTopology Discovery complete.")
-            self.set_edges_position()
-            self.configure_topo_ports()
-            self.configure_topo_rules()
+            self.init_time = time.time()
+            self.logger.info(
+                "\nTopology Discovery complete." +
+                "\nWaiting for %s seconds while checking switch layers.",
+                _lldpTimeout
+            )
 
     #-------------------------------------------------------------------------
     #   * RYU Event: Switch Leave
@@ -166,7 +186,12 @@ class MiceDCERApi(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            # Handle LLDP packet if LLDP checking is not done
+            if not self.lldp_complete:
+                self.lldp_packet_handler(msg, pkt)
+            return
+        elif eth.ethertype == ether_types.ETH_TYPE_ARP:
             # Handle ARP packet
             self.arp_packet_handler(msg, pkt)
             return
@@ -311,6 +336,84 @@ class MiceDCERApi(app_manager.RyuApp):
             self.install_swrules_core(core)
 
     #-------------------------------------------------------------------------
+    #   * LLDP Packet Handler
+    #-------------------------------------------------------------------------
+
+    def lldp_packet_handler(self, msg, pkt):
+
+        dp = msg.datapath
+        dpid = dp.id
+
+        # Get LLDPDU Information
+        #
+        # It is obtained as a matrix of objects in tlvs, where
+        # position 0 is the Chassis ID object, 1 is the Port ID
+        # object, 2 is the TTL object, 3 is the first TLV, 4 is
+        # the second TLV and so on. The TLVs are optional and
+        # may be inserted in any order. The matrix ends with an
+        # End object, which can be obtained by tlvs[-1].
+        #
+        # To obtain the dpid of the LLDPDU, is needed to get
+        # first the information from the Chassis ID. It is a
+        # string headed by 'dpid:', so its necessary to replace
+        # it with '0x' so it can be parsed easily as a hex value.
+        #
+        pkt_lldp = pkt.get_protocol(lldp.lldp)
+        lldp_tlvs = pkt_lldp.tlvs
+        lldp_dpid = int(lldp_tlvs[0].chassis_id.replace('dpid:', '0x'), 16)
+
+        # Get Time from completion of Topology Discovery
+        elapsed_time = time.time() - self.init_time
+
+        # Update Neighbor List
+        if lldp_dpid not in self.lldp_neighbors[dpid]:
+            self.lldp_neighbors[dpid].append(lldp_dpid)
+        neighbors = len(self.lldp_neighbors[dpid])
+
+        # Check for Edge Switches
+        if elapsed_time > _lldpTimeout:
+            if not self.lldp_timeout:
+                self.lldp_timeout = True
+                self.logger.info("Time for parsing LLDP packets out.")
+            if neighbors <= self.switch_info[dpid]['ports'] / 2:
+                self.lldp_level[dpid] = 3
+                self.logger.info("Switch %s is an edge switch.", dpid)
+
+        # Check for Aggregate Switches
+        if self.lldp_level[lldp_dpid] == 3:
+            self.lldp_level[dpid] = 2
+            self.logger.info("Switch %s is an aggregate switch.", dpid)
+
+        # Check for Core Switches
+        if (self.lldp_level[dpid] == 0
+        and neighbors == self.switch_info[dpid]['ports']):
+            is_core = True
+            for sw in self.lldp_neighbors[dpid]:
+                if self.lldp_level[sw] != 2:
+                    is_core = False
+                    break
+            if is_core:
+                self.lldp_level[dpid] = 1
+                self.logger.info("Switch %s is a core switch.", dpid)
+
+        # Check if LLDP Checking is complete
+        for dpid, level in list(self.lldp_level.items()):
+            self.lldp_complete = True
+            if level == 0:
+                self.lldp_complete = False
+                break
+
+        # Configure Topology
+        if self.lldp_complete:
+            self.logger.info("\nLLDP switch layer checking complete.")
+            self.init_time = time.time()
+            for info in list(self.switch_info.values()):
+                self.configure_switch(info['dp'])
+            self.set_edges_position()
+            self.configure_topo_ports()
+            self.configure_topo_rules()
+
+    #-------------------------------------------------------------------------
     #   * ARP Packet Handler
     #-------------------------------------------------------------------------
 
@@ -332,6 +435,7 @@ class MiceDCERApi(app_manager.RyuApp):
         dst_ip = pkt_arp.dst_ip
 
         dpid = dp.id
+        timestamp = time.time() - self.init_time
 
         # Check if packet comes from host
         if (in_port != ofp.OFPP_CONTROLLER
@@ -349,31 +453,34 @@ class MiceDCERApi(app_manager.RyuApp):
                 self.installed_rules.append((dp, src_mac, pmac))
                 self.install_rule_pmac(dp, src_mac, pmac, in_port)
 
+        self.time_table[src_ip] = timestamp
+
         if pkt_arp.opcode == 1:  # ARP request
 
             self.logger.info(
                 "\nReceived ARP request in datapath (%s), port %s:" +
-                "\n%s (%s) -> %s (%s)\n: From (%s) to (%s)",
+                "\n%s (%s) -> %s (%s)\n: From (%s) to (%s)" +
+                "\n: at time %s",
                 dpid, in_port, src_ip, src_mac, dst_ip, dst_mac,
-                eth_src, eth_dst
+                eth_src, eth_dst, self.get_time_string(timestamp)
             )
 
             # If the destination IP is unknown by the controller
             if dst_ip not in self.ip_table:
 
-                self.pending_reqs.append({
-                    'srcIp': src_ip, 'dstIp': dst_ip
-                })
+                # Add to list of Pending Requests
+                req = {'srcIp': src_ip, 'dstIp': dst_ip}
+                if req not in self.pending_reqs:
+                    self.pending_reqs.append(req)
                 self.logger.info(": Pending requests: %s",
                     self.pending_reqs)
 
                 # Rewrite ARP source MAC (arp_sha) with host PMAC
                 actions = [ofp_parser.OFPActionSetField(arp_sha=pmac),
                            ofp_parser.OFPActionOutput(ofp.OFPP_ALL)]
-                self.logger.info(": Changed source MAC to PMAC: %s -> %s",
+                self.logger.info(": Changed source MAC to PMAC: %s -> %s" +
+                                 ": ALL",
                                  src_mac, pmac)
-
-                self.logger.info(": FLOOD")
                 data = msg.data
                 out = ofp_parser.OFPPacketOut(
                     datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
@@ -409,38 +516,92 @@ class MiceDCERApi(app_manager.RyuApp):
                         )
 
             else:
-                dst_pmac = self.ip_table[dst_ip]['pmac']
+                if (self.time_table[src_ip] - self.time_table[dst_ip]
+                > _threshold):
 
-                # Generate Reply Packet
-                e = ethernet.ethernet(src=dst_pmac, dst=src_mac,
-                                      ethertype=ether_types.ETH_TYPE_ARP)
-                a = arp.arp(src_mac=dst_pmac, src_ip=dst_ip,
-                            dst_mac=src_mac, dst_ip=src_ip, opcode=2)
-                p = packet.Packet()
-                p.add_protocol(e)
-                p.add_protocol(a)
-                p.serialize()
+                    # Add to list of Pending Requests
+                    req = {'srcIp': src_ip, 'dstIp': dst_ip}
+                    if req not in self.pending_reqs:
+                        self.pending_reqs.append(req)
+                    self.logger.info(": Pending requests: %s",
+                        self.pending_reqs)
 
-                self.logger.info(
-                    ": Replied to request in datapath (%s), port %s:" +
-                    "\n: %s (%s) -> %s (%s)",
-                    dpid, in_port, dst_pmac, dst_ip, src_mac, src_ip
-                )
+                    # Rewrite ARP source MAC (arp_sha) with host PMAC
+                    actions = [ofp_parser.OFPActionSetField(arp_sha=pmac),
+                               ofp_parser.OFPActionOutput(ofp.OFPP_ALL)]
+                    self.logger.info(": Changed source MAC to PMAC: %s -> %s" +
+                                     ": ALL",
+                                     src_mac, pmac)
+                    data = msg.data
+                    out = ofp_parser.OFPPacketOut(
+                        datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                        in_port=in_port, actions=actions, data=data
+                    )
+                    dp.send_msg(out)
 
-                # Send Reply Packet
-                actions = [ofp_parser.OFPActionOutput(in_port)]
-                out = ofp_parser.OFPPacketOut(
-                    datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
-                    in_port=ofp.OFPP_CONTROLLER, actions=actions, data=p.data
-                )
-                dp.send_msg(out)
+                    # Generate Check Request
+                    e = ethernet.ethernet(src=pmac, dst=eth_dst,
+                                          ethertype=ether_types.ETH_TYPE_ARP)
+                    a = arp.arp(src_mac=pmac, src_ip=src_ip,
+                                dst_mac=dst_mac, dst_ip=dst_ip, opcode=1)
+                    p = packet.Packet()
+                    p.add_protocol(e)
+                    p.add_protocol(a)
+                    p.serialize()
+
+                    for edge in self.edges:
+                        if edge.id != dpid:
+                            # Send Request Packet
+                            actions = [ofp_parser.OFPActionOutput(ofp.OFPP_ALL)]
+                            out = ofp_parser.OFPPacketOut(
+                                datapath=edge, buffer_id=ofp.OFP_NO_BUFFER,
+                                in_port=ofp.OFPP_CONTROLLER, actions=actions,
+                                data=p.data
+                            )
+                            edge.send_msg(out)
+
+                            self.logger.info(
+                                ": Check Request generated in datapath (%s) " +
+                                "to all ports: \n: %s (%s) -> %s (%s)",
+                                edge.id, pmac, src_ip, dst_mac, dst_ip
+                            )
+                else:
+
+                    dst_pmac = self.ip_table[dst_ip]['pmac']
+
+                    # Generate Reply Packet
+                    e = ethernet.ethernet(src=dst_pmac, dst=src_mac,
+                                          ethertype=ether_types.ETH_TYPE_ARP)
+                    a = arp.arp(src_mac=dst_pmac, src_ip=dst_ip,
+                                dst_mac=src_mac, dst_ip=src_ip, opcode=2)
+                    p = packet.Packet()
+                    p.add_protocol(e)
+                    p.add_protocol(a)
+                    p.serialize()
+
+                    self.logger.info(
+                        ": Replied to request in datapath (%s), port %s:" +
+                        "\n: %s (%s) -> %s (%s)",
+                        dpid, in_port, dst_pmac, dst_ip, src_mac, src_ip
+                    )
+
+                    # Send Reply Packet
+                    actions = [ofp_parser.OFPActionOutput(in_port)]
+                    out = ofp_parser.OFPPacketOut(
+                        datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                        in_port=ofp.OFPP_CONTROLLER, actions=actions,
+                        data=p.data
+                    )
+                    dp.send_msg(out)
 
         elif pkt_arp.opcode == 2:  # ARP reply
 
             self.logger.info(
                 "\nReceived ARP reply in datapath (%s), port %s:" +
-                "\n%s (%s) -> %s (%s)",
-                dpid, in_port, src_ip, src_mac, dst_ip, dst_mac
+                "\n%s (%s) -> %s (%s)" +
+                "\n: at time %s",
+                dpid, in_port, src_ip, src_mac, dst_ip, dst_mac,
+                self.get_time_string(timestamp)
             )
 
             # Reply to Pending Request
@@ -606,7 +767,7 @@ class MiceDCERApi(app_manager.RyuApp):
 
             self.logger.info("Rule installed on datapath (%s): " +
                              "\n: [IPv4] Dst: (%s, %s) -> Port %s",
-                             dp.id, pmac, mask, port)
+                             dp.id, pmac, mask, port[0])
 
     #-------------------------------------------------------------------------
     #   * Install Rules (Core Switch)
@@ -840,12 +1001,23 @@ class MiceDCERApi(app_manager.RyuApp):
 
     def get_dpid_string(self, dpid):
 
-        # Return Hex String from Physical Switch
-        if _physicSwitch:
-            return "{:16x}".format(dpid)
-
         # Return DPID as String
         return str(dpid)
+
+    #-------------------------------------------------------------------------
+    #   * Get Time String
+    #-------------------------------------------------------------------------
+
+    def get_time_string(self, timestamp):
+
+        # Return Time String
+        return "%dd %02d:%02d\'%02d\"%03d" % (
+                timestamp / 60 / 60 / 24,
+                timestamp / 60 / 60 % 24,
+                timestamp / 60 % 60,
+                timestamp % 60,
+                timestamp * 1000 % 1000
+            )
 
     #-------------------------------------------------------------------------
     #   * Get Switch Level
@@ -861,8 +1033,5 @@ class MiceDCERApi(app_manager.RyuApp):
         }
 
         # Get Key from DPID
-        if _physicSwitch:
-            key = (dpid >> 48) / 1000
-        else:
-            key = (dpid) / 1000
+        key = self.lldp_level[dpid]
         return levels.get(key, "UNDEFINED")
