@@ -9,12 +9,16 @@ It has been tested in virtual _k_-ary FatTree topology with Ryu 4.23 and Mininet
 This repository also includes Chadi Assi's presentation of the algorithm.
 
 ## Changelog:
+* **Alpha Version 4 - 2018.11.13**
+  * Switch layers are now determined by checking the reception of LLDP packets.
+  * Implemented ARP stale time function.
+
 * **Alpha Version 3 - 2018.10.28**
   * Fix ARP stormflood bug by dropping the ARP packets on core and aggregate switches instead of flooding them.
   * Controller now generates requests on edge switches when receiving an ARP request.
 
 * **Alpha Version 2 - 2018.10.25**
-  * Fix a lot of bugs from initial version
+  * Fix a lot of bugs from initial version.
 
 * **Alpha Version 1 - 2018.10.15**
-  * Initial Version
+  * Initial Version.
